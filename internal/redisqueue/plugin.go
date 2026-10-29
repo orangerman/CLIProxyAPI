@@ -9,8 +9,10 @@ import (
 
 	"github.com/google/uuid"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagehistory"
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
 )
 
 func init() {
@@ -174,6 +176,13 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	})
 	if err != nil {
 		return
+	}
+	clientIP := strings.TrimSpace(clientRequestMetadata.ResolvedClientIP)
+	if clientIP == "" {
+		clientIP = clientRequestMetadata.ClientIP
+	}
+	if errHistory := usagehistory.Record(record, clientIP); errHistory != nil {
+		log.WithError(errHistory).Warn("usage history could not persist a record")
 	}
 	Enqueue(payload)
 }

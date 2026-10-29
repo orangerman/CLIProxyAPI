@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagehistory"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
@@ -253,6 +255,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
 	s.managementRoutesEnabled.Store(hasManagementSecret)
 	redisqueue.SetEnabled(hasManagementSecret || (cfg != nil && cfg.Home.Enabled))
+	if configFilePath != "" {
+		usagehistory.Configure(filepath.Join(filepath.Dir(configFilePath), ".usage-history"))
+	}
 	if hasManagementSecret {
 		s.registerManagementRoutes()
 	}
