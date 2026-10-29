@@ -55,6 +55,7 @@ AGENTS.override.md
 _bmad/*
 _bmad-output/*
 .gocache/
+scripts/__pycache__/
 .gitnexus/
 
 # macOS
