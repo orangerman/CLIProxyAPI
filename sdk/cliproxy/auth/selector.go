@@ -468,10 +468,14 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 }
 
 func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+	return collectAvailableByPriorityForRequest(nil, auths, model, now)
+}
+
+func collectAvailableByPriorityForRequest(ctx context.Context, auths []*Auth, model string, now time.Time, clientHeaders ...http.Header) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
-		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
+		blocked, reason, next := isAuthBlockedForModelForRequest(ctx, candidate, model, now, clientHeaders...)
 		if !blocked {
 			priority := authPriority(candidate)
 			available[priority] = append(available[priority], candidate)
@@ -514,7 +518,7 @@ func getSelectorAvailableAuthsWithPriorityMode(ctx context.Context, auths []*Aut
 			return auths, nil
 		}
 	}
-	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, allPriorities)
+	return getAvailableAuthsWithPriorityModeForRequest(ctx, auths, provider, model, now, allPriorities)
 }
 
 func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -522,11 +526,15 @@ func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, no
 }
 
 func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, now time.Time, allPriorities bool) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityModeForRequest(nil, auths, provider, model, now, allPriorities)
+}
+
+func getAvailableAuthsWithPriorityModeForRequest(ctx context.Context, auths []*Auth, provider, model string, now time.Time, allPriorities bool, clientHeaders ...http.Header) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, earliest := collectAvailableByPriorityForRequest(ctx, auths, model, now, clientHeaders...)
 	if len(availableByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
@@ -821,22 +829,36 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	return available[0], nil
 }
 
+// IsAuthAvailableForModel reports whether auth is eligible for selection on model at now.
+func IsAuthAvailableForModel(auth *Auth, model string, now time.Time) bool {
+	blocked, _, _ := isAuthBlockedForModel(auth, model, now)
+	return !blocked
+}
+
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
+	return isAuthBlockedForModelForRequest(nil, auth, model, now)
+}
+
+func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if codexRefreshMissingAccessForRequest(ctx, auth, clientHeaders...) {
+		return true, blockReasonOther, time.Time{}
+	}
 	if hasUnauthorizedAuthFailure(auth) {
 		return true, blockReasonOther, time.Time{}
 	}
-	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
+	if exp, ok := auth.AccessTokenExpirationTimeForRequest(ctx, clientHeaders...); ok && !exp.IsZero() && !exp.After(now) {
 		return true, blockReasonOther, time.Time{}
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 		return true, blockReasonCooldown, auth.Quota.NextRecoverAt
 	}
+	unavailable := codexRefreshUnavailableForRequest(ctx, auth, now, clientHeaders...)
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			modelKey := canonicalModelKey(model)
@@ -870,17 +892,17 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 			}
 			return false, blockReasonNone, time.Time{}
 		}
-		return availabilityBlock(auth.Unavailable, auth.Quota.Exceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
+		return availabilityBlock(unavailable, auth.Quota.Exceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
 	}
 	quotaExceeded := auth.Quota.Exceeded
 	// When model is empty and the credential has individual model states, auth.Quota.Exceeded
 	// is an aggregate of single-model quota cooldowns (reason "quota"). As long as the credential
 	// itself is not unavailable (not all models failed) and not under a credential-wide quota,
 	// do not treat individual model cooldowns as blocking the entire credential.
-	if len(auth.ModelStates) > 0 && auth.Quota.Reason != "credential_quota" && !auth.Unavailable {
+	if len(auth.ModelStates) > 0 && auth.Quota.Reason != "credential_quota" && !unavailable {
 		quotaExceeded = false
 	}
-	return availabilityBlock(auth.Unavailable, quotaExceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
+	return availabilityBlock(unavailable, quotaExceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
 }
 
 func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextRecoverAt, now time.Time) (bool, blockReason, time.Time) {
@@ -971,16 +993,23 @@ func shouldRebindSessionAffinityOnError(err *Error) bool {
 }
 
 func isAuthBlockedByQuotaOrAuthForModel(auth *Auth, model string, now time.Time) bool {
+	return isAuthBlockedByQuotaOrAuthForModelForRequest(nil, auth, model, now)
+}
+
+func isAuthBlockedByQuotaOrAuthForModelForRequest(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) bool {
 	if auth == nil {
 		return true
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true
 	}
+	if codexRefreshMissingAccessForRequest(ctx, auth, clientHeaders...) {
+		return true
+	}
 	if hasUnauthorizedAuthFailure(auth) {
 		return true
 	}
-	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
+	if exp, ok := auth.AccessTokenExpirationTimeForRequest(ctx, clientHeaders...); ok && !exp.IsZero() && !exp.After(now) {
 		return true
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && (auth.Quota.NextRecoverAt.IsZero() || auth.Quota.NextRecoverAt.After(now)) {
@@ -1002,10 +1031,11 @@ func isAuthBlockedByQuotaOrAuthForModel(auth *Auth, model string, now time.Time)
 		return false
 	}
 	quota := auth.Quota
-	if len(auth.ModelStates) > 0 && auth.Quota.Reason != "credential_quota" && !auth.Unavailable {
+	unavailable := codexRefreshUnavailableForRequest(ctx, auth, now, clientHeaders...)
+	if len(auth.ModelStates) > 0 && auth.Quota.Reason != "credential_quota" && !unavailable {
 		quota.Exceeded = false
 	}
-	return isStateBlockedByQuotaOrAuth(auth.Unavailable, quota, auth.NextRetryAfter, auth.LastError, now)
+	return isStateBlockedByQuotaOrAuth(unavailable, quota, auth.NextRetryAfter, auth.LastError, now)
 }
 
 func isStateBlockedByQuotaOrAuth(unavailable bool, quota QuotaState, nextRetryAfter time.Time, lastErr *Error, now time.Time) bool {
@@ -1035,7 +1065,7 @@ func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx conte
 	}
 	for _, candidate := range candidates {
 		if candidate != nil && candidate.ID == authID {
-			return !isAuthBlockedByQuotaOrAuthForModel(candidate, model, now)
+			return !isAuthBlockedByQuotaOrAuthForModelForRequest(ctx, candidate, model, now)
 		}
 	}
 	return false
